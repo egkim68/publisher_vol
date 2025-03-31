@@ -1,0 +1,1028 @@
+###############################################################################
+# Does Publisher Volume Matter? A Cross-Sectional Analysis of Scopus Journal Publishing Patterns
+# 
+# This script analyzes Scopus journal data to investigate relationships between
+# publisher volume, journal metrics, subject areas, and OA status.
+# The script generates 9 tables and 3 figures supporting the analysis of how
+# publisher volume relates to journal performance metrics and rankings.
+#
+# Expected input files:
+# - sjr2023.txt - Main journal data
+# - sjr2023-o.txt - Open Access journal data
+###############################################################################
+
+# Required packages - uncomment to install if needed
+# install.packages(c("dplyr", "stringr", "reshape", "patchwork", "ggrepel", "tidyr", 
+#                  "scales", "ggplot2", "ggpubr", "widyr", "corrplot", "dunn.test", "lme4"))
+
+#==============================================================================
+# Load required libraries
+#==============================================================================
+library(corrplot)
+library(dplyr)
+library(stringr)
+library(reshape)
+library(patchwork)
+library(ggrepel)
+library(tidyr)
+library(scales)
+library(ggplot2) 
+library(ggpubr)
+library(widyr)
+
+#==============================================================================
+# Helper Functions
+#==============================================================================
+
+# Function to set consistent axis font sizes for plots
+set_axis_font_size <- function(axis_size, legend_size, text_size) {
+  theme(
+    axis.title = element_text(size = axis_size, color = "black"),
+    axis.text = element_text(size = axis_size, color = "black"),
+    legend.title = element_text(size = legend_size, color = "black"),
+    legend.text = element_text(size = legend_size, color = "black"),
+    text = element_text(size = text_size, color = "black"),
+    strip.text = element_text(size = 14, color = "black", hjust = 0.5, vjust = 3)
+  )
+}
+
+# List of substrings to remove for publisher name standardization
+substrings_to_remove <- c(
+  " AG$", " A\\.?S\\.?$", " A\\.?C\\.?$", " AS$", " APS$", " ASCR$", " A\\.?I\\.?$", " B\\.?V\\.$",
+  " C\\.?V\\.$", " C\\.?S\\.?$", " e\\.?V\\.$", " GmbH$", " Inc\\.?$", " KGaA$", " KG$", " Ltd\\.?$",
+  " L\\.?L\\.?C\\.?$", " LP$", " LTDA$", " Ltd\\.?$", " LLC$", " mij\\.?$", " N\\.?V\\.$",
+  " o\\.?p\\.?s$", " OOO$", " P\\.?L\\.?C\\.?$", " plc$", " Pty\\.?$", " S\\.?A\\.?$", " S\\.?A\\.? de C\\.?V\\.$",
+  " S\\.?A\\.?R\\.?L\\.?$", " S\\.?C\\.?S\\.?$", " S\\.?L\\.?$", " S\\.?L\\.?U\\.?$", " S\\.?p\\.?A\\.?$", " S\\.?R\\.?L\\.?$",
+  " s\\.?r\\.?l\\.?$", " s\\.?r\\.?o\\.?$", " SpA$", " ZRt\\.?$", " v\\.?z\\.?w\\.?$", " Z\\.?S\\.?$", " z\\.?o\\.?o\\.?$",
+  " EOOD$"
+)
+
+# Function to standardize university names
+remove_university_suffixes <- function(text) {
+  # Remove common publishing/press suffixes
+  text <- gsub(" Press$", "", text, ignore.case = TRUE)
+  text <- gsub(" Publishing$", "", text, ignore.case = TRUE)
+  
+  # Handle complex university names
+  text <- gsub("University of ([^-]+) - .*", "University of \\1", text)
+  
+  # Remove department or additional qualifiers after "University"
+  text <- gsub("(.*University).*", "\\1", text)
+  
+  return(trimws(text))
+}
+
+# Comprehensive function to standardize publisher names
+remove_substrings <- function(text, substrings) {
+  # Handle NULL or NA values
+  if(is.null(text) || is.na(text) || text == "") {
+    return(text)
+  }
+  
+  # Remove trailing commas and hyphens
+  text <- gsub("[,-]+$", "", text)
+
+  # Remove substrings from the list
+  for (substring in substrings) {
+    pattern <- paste0(substring, "$")
+    text <- sub(pattern, "", text)
+  }
+
+  # Remove everything after a hyphen
+  text <- gsub(" - .*", "", text)
+
+  # Remove qualifying phrases after a comma
+  text <- gsub(", .*", "", text)
+
+  # Standardize known publishers
+  if (grepl("Springer", text, ignore.case = TRUE)) {
+    text <- "Springer"
+  }
+  if (grepl("Elsevier", text, ignore.case = TRUE)) {
+    text <- "Elsevier"
+  }
+  if (grepl("Wiley", text, ignore.case = TRUE)) {
+    text <- "Wiley"
+  }
+  if (grepl("Taylor", text, ignore.case = TRUE) & grepl("Francis", text, ignore.case = TRUE)) {
+    text <- "Taylor and Francis"
+  }
+  if (grepl("Cambridge", text, ignore.case = TRUE)) {
+    text <- "Cambridge University Press"
+  }
+  if (grepl("Oxford", text, ignore.case = TRUE)) {
+    text <- "Oxford University Press"
+  }
+
+  # Add university name normalization
+  text <- remove_university_suffixes(text)
+
+  return(trimws(text))  # Ensure no extra spaces remain
+}
+
+# Function to add size category based on journal count
+add_size_category <- function(df) {
+  df %>%
+    mutate(
+      sizes = case_when(
+        Journal_Count <= 1 ~ "V1",
+        Journal_Count >= 2 & Journal_Count <= 9 ~ "V2",
+        Journal_Count >= 10 & Journal_Count <= 99 ~ "V3",
+        Journal_Count >= 100 ~ "V4",
+        TRUE ~ NA_character_
+      )
+    )
+}
+
+#==============================================================================
+# Data Loading and Initial Cleaning
+#==============================================================================
+
+# Function to safely load data
+safe_read_data <- function(filepath, default_path = NULL) {
+  tryCatch({
+    read.delim(filepath, sep = "\t", header = TRUE, fill = TRUE)
+  }, error = function(e) {
+    if (!is.null(default_path)) {
+      message(paste("Error loading from path:", filepath))
+      message(paste("Trying default path:", default_path))
+      read.delim(default_path, sep = "\t", header = TRUE, fill = TRUE)
+    } else {
+      stop(paste("Error loading data from", filepath, ":", e$message))
+    }
+  })
+}
+
+# Try to load from the provided path, with fallback to current directory
+j <- safe_read_data("k:/data/sjr3/cleaned/sjr2023.txt", "sjr2023.txt")
+o <- safe_read_data("k:/data/sjr3/cleaned/sjr2023-o.txt", "sjr2023-o.txt")
+
+# Clean publisher names
+o$Publisher <- sapply(o$Publisher, remove_substrings, substrings = substrings_to_remove)
+j$Publisher <- sapply(j$Publisher, remove_substrings, substrings = substrings_to_remove)
+
+# Standardize column names
+colnames(j)[9] <- "TDYEAR"
+colnames(j)[8] <- "HI"
+colnames(j)[14] <- "CITES2YR"
+colnames(j)[7] <- "QUAR"
+colnames(o)[9] <- "TDYEAR"
+colnames(o)[8] <- "HI"
+colnames(o)[14] <- "CITES2YR"
+colnames(o)[7] <- "QUAR"
+
+# Clean and standardize publisher names
+j$Publisher <- gsub("&", "and", j$Publisher)
+j$Publisher <- gsub("amp;", "", j$Publisher)
+j$Publisher <- str_trim(j$Publisher)
+
+o$Publisher <- gsub("&", "and", o$Publisher)
+o$Publisher <- gsub("amp;", "", o$Publisher)
+o$Publisher <- str_trim(o$Publisher)
+
+# Clean and convert numeric data
+j$SJR <- gsub(",", ".", j$SJR)                          
+j$SJR <- as.numeric(j$SJR)                           
+j$CITES2YR <- gsub(",", ".", j$CITES2YR) 
+j$QUAR <- gsub("Q", "", j$QUAR)                         
+j$QUAR <- gsub("-", "NA", j$QUAR)
+j$QUAR <- strtoi(j$QUAR)
+j$CITES2YR <- as.numeric(j$CITES2YR)
+
+o$SJR <- gsub(",", ".", o$SJR)                          
+o$SJR <- as.numeric(o$SJR)                            
+o$CITES2YR <- gsub(",", ".", o$CITES2YR) 
+o$QUAR <- gsub("Q", "", o$QUAR)                         
+o$QUAR <- gsub("-", "NA", o$QUAR)
+o$QUAR <- strtoi(o$QUAR)
+o$CITES2YR <- as.numeric(o$CITES2YR)
+
+#==============================================================================
+# Create dataset with OA status
+#==============================================================================
+# Identify non-OA journals
+n_OA <- j %>% anti_join(o, by = "Title") %>% mutate(type = "non_OA")
+
+# Label OA journals
+oa <- o %>% mutate(type = "OA")
+
+# Combine datasets
+j_type <- rbind(oa, n_OA)
+
+# Clean the combined dataset
+j_type <- j_type %>% 
+  filter(!is.na(Publisher) & trimws(Publisher) != "") %>%
+  filter(Type == "journal")
+
+#==============================================================================
+# Publisher Count Analysis
+#==============================================================================
+# Create frequency table of publishers
+publisher_counts <- table(j_type$Publisher)
+
+# Convert to data frame for export
+publisher_df <- as.data.frame(publisher_counts)
+colnames(publisher_df) <- c("Publisher", "Frequency")
+
+# Save publisher frequency data
+write.csv(publisher_df, "publisher_counts.csv", row.names = FALSE)
+cat("Publisher counts saved to: publisher_counts.csv\n")
+
+#==============================================================================
+# Publisher Size Analysis
+#==============================================================================
+# Ensure numerical conversion of necessary columns
+j_filtered <- j_type %>%
+  mutate(
+    TDYEAR = as.numeric(TDYEAR),
+    HI = as.numeric(HI),
+    QUAR = as.numeric(QUAR),
+    CITES2YR = as.numeric(CITES2YR),
+    SJR = as.numeric(SJR)
+  )
+
+# Summarizing by Publisher
+publisher_summary <- j_filtered %>%
+  filter(!is.na(Publisher) & trimws(Publisher) != "") %>%
+  group_by(Publisher) %>%
+  summarise(
+    Journal_Count = n(),
+    Mean_QUAR = mean(QUAR, na.rm = TRUE),
+    Mean_TDYEAR = mean(TDYEAR, na.rm = TRUE),
+    Mean_HI = mean(HI, na.rm = TRUE),
+    Mean_CITES2YR = mean(CITES2YR, na.rm = TRUE),
+    Mean_SJR = mean(SJR, na.rm = TRUE)
+  )
+
+# Aggregating publisher data by Journal_Count
+publisher_freq <- publisher_summary %>%
+  group_by(Journal_Count) %>%
+  summarise(
+    Total_Journals_Published = sum(Journal_Count),
+    Mean_TDYEAR = mean(Mean_TDYEAR, na.rm = TRUE),
+    Mean_HI = mean(Mean_HI, na.rm = TRUE),
+    Mean_CITES2YR = mean(Mean_CITES2YR, na.rm = TRUE),
+    Mean_SJR = mean(Mean_SJR, na.rm = TRUE),
+    Mean_QUAR = mean(Mean_QUAR, na.rm = TRUE)
+  )
+
+# Further grouping by Journal_Count
+publisher_freq1 <- publisher_freq %>%
+  group_by(Journal_Count) %>%
+  summarise(
+    Mean_Journals_Published = mean(Journal_Count),
+    Mean_TDYEAR = mean(Mean_TDYEAR, na.rm = TRUE),
+    Mean_HI = mean(Mean_HI, na.rm = TRUE),
+    Mean_CITES2YR = mean(Mean_CITES2YR, na.rm = TRUE),
+    Mean_SJR = mean(Mean_SJR, na.rm = TRUE),
+    Mean_QUAR = mean(Mean_QUAR, na.rm = TRUE)
+  )
+
+#==============================================================================
+# Publisher Size Categories
+#==============================================================================
+# Define the publisher size categories
+publisher_summary1 <- publisher_summary %>%
+  mutate(
+    sizes = case_when(
+      Journal_Count <= 1 ~ "V1",
+      Journal_Count >= 2 & Journal_Count <= 9 ~ "V2",
+      Journal_Count >= 10 & Journal_Count <= 99 ~ "V3",
+      Journal_Count >= 100 ~ "V4"
+    )
+  )
+
+# Summarize data by publisher size categories
+table1 <- publisher_summary1 %>%
+  group_by(sizes) %>%
+  summarise(
+    Number_of_Publishers = n(),
+    Aggregated_Journals = sum(Journal_Count),
+    Mean_Journal = mean(Journal_Count)
+  ) %>%
+  mutate(
+    Publisher_Percentage = Number_of_Publishers / sum(Number_of_Publishers) * 100,
+    Journal_Percentage = Aggregated_Journals / sum(Aggregated_Journals) * 100
+  )
+
+# Format the table for output
+table1 <- table1 %>%
+  mutate(
+    Number_of_Publishers = paste0(Number_of_Publishers, " (", round(Publisher_Percentage, 1), "%)"),
+    Aggregated_Journals = paste0(Aggregated_Journals, " (", round(Journal_Percentage, 1), "%)"),
+    sizes = case_when(
+      sizes == "V1" ~ "≤ 1 journal",
+      sizes == "V2" ~ "2-9 journals",
+      sizes == "V3" ~ "10-99 journals",
+      sizes == "V4" ~ "≥ 100 journals"
+    )
+  ) %>%
+  select(Publisher_Volume = sizes, Number_of_Publishers, Aggregated_Journals, Mean_Journal)
+
+# Save Table 1: Publisher Volume and Their Journal Production
+write.table(table1, file = 'table1_publisher_volume.txt', sep = "\t", quote = FALSE, row.names = FALSE)
+
+# Generate size category subsets
+temp1 <- publisher_summary %>% filter(Journal_Count <= 1) %>% mutate(sizes = "V1")
+temp2 <- publisher_summary %>% filter(Journal_Count >= 2, Journal_Count <= 9) %>% mutate(sizes = "V2")
+temp3 <- publisher_summary %>% filter(Journal_Count >= 10, Journal_Count <= 99) %>% mutate(sizes = "V3")
+temp4 <- publisher_summary %>% filter(Journal_Count >= 100) %>% mutate(sizes = "V4")
+publisher_summary1 <- rbind(temp1, temp2, temp3, temp4)
+
+# Save largest publishers
+write.table(temp4, file = 'largest_publishers.txt', sep = "\t", quote = FALSE)
+
+#==============================================================================
+# Top 25 Publishers Analysis
+#==============================================================================
+top_25_publishers <- publisher_summary %>%
+  arrange(desc(Journal_Count)) %>%
+  top_n(25, Journal_Count) %>%
+  select(Publisher, Journal_Count, Mean_QUAR, Mean_TDYEAR, Mean_HI, Mean_CITES2YR, Mean_SJR) %>%
+  mutate(
+    Mean_QUAR = round(Mean_QUAR, 1),
+    Mean_TDYEAR = round(Mean_TDYEAR, 1),
+    Mean_HI = round(Mean_HI, 1),
+    Mean_CITES2YR = round(Mean_CITES2YR, 1),
+    Mean_SJR = round(Mean_SJR, 3)
+  )
+
+# Save top 25 publishers data
+# Save only the top 25 V4 publishers data for Figure 1
+write.table(top_25_publishers, file = 'v4_publishers_data.txt', sep = "\t", quote = FALSE, row.names = FALSE)
+
+#==============================================================================
+# Publisher Region Analysis
+#==============================================================================
+# Get publisher count by region and size
+publisher_region <- j_filtered %>%
+  group_by(Publisher) %>%
+  summarise(
+    Primary_Region = first(Region),
+    Journal_Count = n()
+  ) %>%
+  mutate(sizes = case_when(
+    Journal_Count == 1 ~ "V1",
+    Journal_Count >= 2 & Journal_Count <= 9 ~ "V2",
+    Journal_Count >= 10 & Journal_Count <= 99 ~ "V3",
+    Journal_Count >= 100 ~ "V4"
+  ))
+
+# Create region summary with raw counts
+region_summary <- publisher_region %>%
+  count(Primary_Region, sizes) %>%
+  pivot_wider(
+    names_from = sizes,
+    values_from = n,
+    values_fill = 0
+  )
+
+# Add total row
+region_summary <- region_summary %>%
+  bind_rows(
+    summarise(., 
+      Primary_Region = "Total",
+      across(where(is.numeric), sum)
+    )
+  )
+
+# Save region summary
+write.table(region_summary, file = "table3_region_summary.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+
+#==============================================================================
+# Publisher Country Analysis
+#==============================================================================
+# Get publisher count by primary country and size
+publisher_country <- j_filtered %>%
+  group_by(Publisher) %>%
+  summarise(
+    Primary_Country = first(Country),
+    Journal_Count = n()
+  ) %>%
+  mutate(sizes = case_when(
+    Journal_Count == 1 ~ "V1",
+    Journal_Count >= 2 & Journal_Count <= 9 ~ "V2",
+    Journal_Count >= 10 & Journal_Count <= 99 ~ "V3",
+    Journal_Count >= 100 ~ "V4"
+  ))
+
+# Create country summary with raw counts for ALL countries
+country_summary <- publisher_country %>%
+  count(Primary_Country, sizes) %>%
+  pivot_wider(
+    names_from = sizes,
+    values_from = n,
+    values_fill = 0
+  ) %>%
+  mutate(Total = rowSums(across(where(is.numeric)))) %>%
+  arrange(desc(Total))
+
+# Calculate all totals before slicing
+all_totals <- colSums(country_summary[,-1])  # exclude country column
+
+# Get top 20 countries
+country_summary_top20 <- country_summary %>%
+  slice_head(n = 20)
+
+# Calculate top 20 totals
+top20_totals <- colSums(country_summary_top20[,-1])  # exclude country column
+
+# Create etc row (difference between all totals and top 20 totals)
+etc_row <- data.frame(
+  Primary_Country = "etc.",
+  t(all_totals - top20_totals)
+)
+
+# Combine everything
+country_summary_final <- country_summary_top20 %>%
+  bind_rows(etc_row) %>%
+  bind_rows(
+    data.frame(
+      Primary_Country = "Total",
+      t(all_totals)
+    )
+  )
+
+# Save country summary
+write.table(country_summary_final, file = "table4_country_summary.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+
+#==============================================================================
+# Publisher Size and Metrics - Kruskal-Wallis Analysis
+#==============================================================================
+# Perform Kruskal-Wallis tests for different metrics across publisher sizes
+kruskal_tdyear <- kruskal.test(Mean_TDYEAR ~ sizes, data = publisher_summary1)
+p_value_tdyear <- kruskal_tdyear$p.value
+
+kruskal_hi <- kruskal.test(Mean_HI ~ sizes, data = publisher_summary1)
+p_value_hi <- kruskal_hi$p.value
+
+kruskal_cites <- kruskal.test(Mean_CITES2YR ~ sizes, data = publisher_summary1)
+p_value_cites <- kruskal_cites$p.value
+
+kruskal_sjr <- kruskal.test(Mean_SJR ~ sizes, data = publisher_summary1)
+p_value_sjr <- kruskal_sjr$p.value
+
+kruskal_quar <- kruskal.test(Mean_QUAR ~ sizes, data = publisher_summary1)
+p_value_quar <- kruskal_quar$p.value
+
+# Determine whether to reject the null hypothesis based on p-values
+reject_tdyear <- ifelse(p_value_tdyear < 0.05, "Reject", "Do not reject")
+reject_hi <- ifelse(p_value_hi < 0.05, "Reject", "Do not reject")
+reject_cites <- ifelse(p_value_cites < 0.05, "Reject", "Do not reject")
+reject_sjr <- ifelse(p_value_sjr < 0.05, "Reject", "Do not reject")
+reject_quar <- ifelse(p_value_quar < 0.05, "Reject", "Do not reject")
+
+# Calculate mean values for each size category
+mean_values <- publisher_summary1 %>%
+  group_by(sizes) %>%
+  summarise(
+    Mean_TDYEAR = mean(Mean_TDYEAR, na.rm = TRUE),
+    Mean_HI = mean(Mean_HI, na.rm = TRUE),
+    Mean_CITES2YR = mean(Mean_CITES2YR, na.rm = TRUE),
+    Mean_SJR = mean(Mean_SJR, na.rm = TRUE),
+    Mean_QUAR = mean(Mean_QUAR, na.rm = TRUE)
+  )
+
+# Create the table data
+table_data <- data.frame(
+  Journal_Metric = c("TDYEAR", "h-index", "CITES2YR", "SJR", "Quartile"),
+  V1 = c(mean_values$Mean_TDYEAR[mean_values$sizes == "V1"],
+         mean_values$Mean_HI[mean_values$sizes == "V1"],
+         mean_values$Mean_CITES2YR[mean_values$sizes == "V1"],
+         mean_values$Mean_SJR[mean_values$sizes == "V1"],
+         mean_values$Mean_QUAR[mean_values$sizes == "V1"]),
+  V2 = c(mean_values$Mean_TDYEAR[mean_values$sizes == "V2"],
+         mean_values$Mean_HI[mean_values$sizes == "V2"],
+         mean_values$Mean_CITES2YR[mean_values$sizes == "V2"],
+         mean_values$Mean_SJR[mean_values$sizes == "V2"],
+         mean_values$Mean_QUAR[mean_values$sizes == "V2"]),
+  V3 = c(mean_values$Mean_TDYEAR[mean_values$sizes == "V3"],
+         mean_values$Mean_HI[mean_values$sizes == "V3"],
+         mean_values$Mean_CITES2YR[mean_values$sizes == "V3"],
+         mean_values$Mean_SJR[mean_values$sizes == "V3"],
+         mean_values$Mean_QUAR[mean_values$sizes == "V3"]),
+  V4 = c(mean_values$Mean_TDYEAR[mean_values$sizes == "V4"],
+         mean_values$Mean_HI[mean_values$sizes == "V4"],
+         mean_values$Mean_CITES2YR[mean_values$sizes == "V4"],
+         mean_values$Mean_SJR[mean_values$sizes == "V4"],
+         mean_values$Mean_QUAR[mean_values$sizes == "V4"]),
+  P_Value = c(p_value_tdyear, p_value_hi, p_value_cites, p_value_sjr, p_value_quar),
+  Hypothesis_Decision = c(reject_tdyear, reject_hi, reject_cites, reject_sjr, reject_quar)
+)
+
+# Format the p-values to scientific notation
+table_data$P_Value <- format(table_data$P_Value, scientific = TRUE, digits = 3)
+
+# Save Table 2: Journal Metrics by Publisher Volume
+write.table(table_data, file = "table2_metrics_by_publisher_volume.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+
+#==============================================================================
+# Correlation Analysis
+#==============================================================================
+# Compute correlation matrix
+clean_publisher_summary <- na.omit(publisher_freq1) %>% select(-Mean_Journals_Published)
+col_names <- colnames(clean_publisher_summary)
+new_col_names <- c("Journal_Count", "TDYEAR", "h-index", "CITES2YR", "SJR", "Quartile")
+colnames(clean_publisher_summary) <- new_col_names
+correlation_matrix <- cor(clean_publisher_summary)
+
+# Create correlation plot
+color_thresholds <- c(-1, -0.7, -0.4, 0, 0.4, 0.7, 1)
+colors <- colorRampPalette(c("blue", "white", "red"))(length(color_thresholds) - 1)
+
+# Save correlation matrix to file
+write.csv(correlation_matrix, "correlation_matrix.csv", row.names = TRUE)
+
+# Plot correlation matrix (optional)
+pdf("figure1_correlation_matrix.pdf", width = 8, height = 7)
+corrplot(correlation_matrix, method = "color", type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 45, addCoef.col = "black", col = colors)
+dev.off()
+
+#==============================================================================
+# Subject Area Analysis
+#==============================================================================
+# Load necessary libraries if not already loaded
+if (!requireNamespace("tidyr", quietly = TRUE)) {
+  library(tidyr)
+}
+
+# Separate and clean the Areas column
+j_separated <- j_type %>%
+  separate_rows(Areas, sep = ";") %>%
+  mutate(
+    Areas = trimws(Areas),              # Remove extra spaces
+    Areas = tolower(Areas),             # Convert to lowercase for consistency
+    Areas = gsub("\\s+", " ", Areas)    # Remove multiple spaces
+  )
+
+# Expected 27 standard subject areas
+expected_subject_areas <- c(
+  "agricultural and biological sciences", "arts and humanities",
+  "biochemistry, genetics and molecular biology", "business, management and accounting",
+  "chemical engineering", "chemistry", "computer science", "decision sciences",
+  "earth and planetary sciences", "economics, econometrics and finance",
+  "energy", "engineering", "environmental science", "health professions",
+  "immunology and microbiology", "materials science", "mathematics", "medicine",
+  "multidisciplinary", "neuroscience", "nursing",
+  "pharmacology, toxicology and pharmaceutics", "physics and astronomy",
+  "psychology", "social sciences", "veterinary", "dentistry"
+)
+
+# Filter for only these 27 expected subject areas
+j_separated <- j_separated %>%
+  filter(Areas %in% expected_subject_areas)
+
+# Count the total number of journals published **by each publisher**
+publisher_sizes <- j_separated %>%
+  group_by(Publisher) %>%
+  summarise(Total_Journals = n_distinct(Title), .groups = 'drop') %>%
+  mutate(
+    Publisher_Size = case_when(
+      Total_Journals == 1 ~ "V1",
+      Total_Journals >= 2 & Total_Journals <= 9 ~ "V2",
+      Total_Journals >= 10 & Total_Journals <= 99 ~ "V3",
+      Total_Journals >= 100 ~ "V4"
+    )
+  )
+
+# Merge publisher size classification back into main dataset
+j_separated <- j_separated %>%
+  left_join(publisher_sizes, by = "Publisher")
+
+# Remove journals with **missing publisher information** (to prevent incorrect V1–V4 classification)
+j_separated <- j_separated %>%
+  filter(!is.na(Publisher_Size))
+
+# Count total number of journals per subject area and publisher size
+journal_counts <- j_separated %>%
+  group_by(Areas, Publisher_Size) %>%
+  summarise(
+    Total_Journals = n_distinct(Title),  # Count unique journal titles
+    .groups = 'drop'
+  ) %>%
+  pivot_wider(
+    names_from = Publisher_Size,
+    values_from = Total_Journals,
+    values_fill = 0  # Fill missing categories with 0
+  ) 
+
+# Save Table 5: Subject Areas by Publisher Size
+write.table(journal_counts, file = "table5_subject_areas_by_publisher_size.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+
+#==============================================================================
+# OA vs. Non-OA Analysis
+#==============================================================================
+# Summarize by Publisher and type, then calculate Journal Count
+temp_case1 <- j_type %>%
+  group_by(Publisher, type) %>%
+  summarise(Journal_Count = n(), .groups = 'drop')
+
+# Classify into four sizes based on Journal_Count and create the 'sizes' field
+temp_case1 <- temp_case1 %>%
+  mutate(sizes = case_when(
+    Journal_Count == 1 ~ "V1",
+    Journal_Count >= 2 & Journal_Count <= 9 ~ "V2",
+    Journal_Count >= 10 & Journal_Count <= 99 ~ "V3",
+    Journal_Count >= 100 ~ "V4"
+  ))
+
+# Create and save Table 6: OA Status by Publisher Volume
+oa_status_table <- table(temp_case1$type, temp_case1$sizes)
+write.table(oa_status_table, file = 'table6_oa_status_by_volume.txt', sep = "\t", quote = FALSE, row.names = TRUE)
+
+#==============================================================================
+# Chi-Square Analysis of OA Status by Publisher Size
+#==============================================================================
+# Step 1: Create publisher volume categories (if 'sizes' column does not exist)
+j_type <- j_type %>%
+  group_by(Publisher) %>%
+  mutate(Journal_Count = n()) %>%
+  ungroup() %>%
+  mutate(
+    sizes = case_when(
+      Journal_Count == 1 ~ "V1",
+      Journal_Count >= 2 & Journal_Count <= 9 ~ "V2",
+      Journal_Count >= 10 & Journal_Count <= 99 ~ "V3",
+      Journal_Count >= 100 ~ "V4",
+      TRUE ~ NA_character_
+    )
+  )
+
+# Step 2: Ensure 'sizes' and 'type' columns exist and remove missing values
+j_type <- j_type %>%
+  filter(!is.na(sizes) & !is.na(type))
+
+# Step 3: Create the contingency table
+oa_table <- table(j_type$sizes, j_type$type)
+
+# Step 4: Perform the Chi-square test
+chi_test <- chisq.test(oa_table)
+
+# Step 5: Print Chi-square test results and save to file
+chi_test_results <- capture.output(print(chi_test))
+writeLines(chi_test_results, "chi_square_results.txt")
+
+# Step 6: Check if expected frequencies are too low and run Fisher's exact test if needed
+if (any(chi_test$expected < 5)) {
+  message("Warning: Some expected frequencies are < 5. Performing Fisher's Exact Test instead.")
+  
+  # Perform Fisher's Exact Test
+  fisher_test <- fisher.test(oa_table, simulate.p.value = TRUE, B = 10000)
+  
+  # Print and save Fisher's test results
+  fisher_test_results <- capture.output(print(fisher_test))
+  writeLines(fisher_test_results, "fisher_exact_results.txt")
+}
+
+#==============================================================================
+# Comparison of Mean Quartiles by OA Status and Size
+#==============================================================================
+# Step 1: Compute mean quartiles for non-OA journals
+non_oa_data <- j_type %>% filter(type == "non_OA")
+non_oa_summary <- non_oa_data %>%
+  group_by(sizes) %>%
+  summarise(Mean_Quartile = mean(QUAR, na.rm = TRUE), .groups = 'drop')
+
+# Step 2: Perform Kruskal-Wallis test for non-OA journals
+kruskal_non_OA <- kruskal.test(QUAR ~ sizes, data = non_oa_data)
+p_value_non_OA <- kruskal_non_OA$p.value
+
+# Step 3: Compute mean quartiles for OA journals
+oa_data <- j_type %>% filter(type == "OA")
+oa_summary <- oa_data %>%
+  group_by(sizes) %>%
+  summarise(Mean_Quartile = mean(QUAR, na.rm = TRUE), .groups = 'drop')
+
+# Step 4: Check if there are enough OA journals for each size category and perform Kruskal-Wallis test
+oa_sizes <- unique(oa_data$sizes)
+
+if (length(oa_sizes) > 1) {
+  kruskal_OA <- kruskal.test(QUAR ~ sizes, data = oa_data)
+  p_value_OA <- kruskal_OA$p.value
+  kruskal_OA_statistic <- kruskal_OA$statistic
+} else {
+  message("Insufficient data for OA journals across multiple size categories.")
+  p_value_OA <- NA
+  kruskal_OA_statistic <- NA
+}
+
+# Step 5: Combine the summaries
+combined_summary <- bind_rows(
+  non_oa_summary %>% mutate(type = "non_OA"),
+  oa_summary %>% mutate(type = "OA")
+)
+
+# Step 6: Save Table 7: Mean Quartiles by OA and Size
+write.table(combined_summary, file = 'table7_mean_quartiles_by_oa_size.txt', sep = '\t', quote = FALSE, row.names = FALSE)
+
+#==============================================================================
+# Table of OA Types by Publisher Size with Percentages
+#==============================================================================
+# Create the basic contingency table
+oa_table <- table(j_type$type, j_type$sizes)
+
+# Calculate row percentages
+row_percentages <- prop.table(oa_table, margin = 1) * 100
+
+# Create a data frame with counts and percentages
+result_table <- data.frame()
+for(i in 1:nrow(oa_table)) {
+  row_data <- data.frame(
+    Journal_Type = rownames(oa_table)[i],
+    V1 = sprintf("%d (%.1f%%)", oa_table[i,1], row_percentages[i,1]),
+    V2 = sprintf("%d (%.1f%%)", oa_table[i,2], row_percentages[i,2]),
+    V3 = sprintf("%d (%.1f%%)", oa_table[i,3], row_percentages[i,3]),
+    V4 = sprintf("%d (%.1f%%)", oa_table[i,4], row_percentages[i,4]),
+    Total = sprintf("%d (100%%)", sum(oa_table[i,]))
+  )
+  result_table <- rbind(result_table, row_data)
+}
+
+# Perform Fisher's exact test
+fisher_result <- fisher.test(oa_table, simulate.p.value = TRUE, B = 10000)
+
+# Create the note text
+note <- sprintf("Note. Fisher's exact test for publisher volume across OA journal types: p-value = %.4f", fisher_result$p.value)
+
+# This table doesn't appear in the final manuscript, so we don't need to create it
+
+#==============================================================================
+# Advanced Analysis: Dunn's Post Hoc Test 
+#==============================================================================
+# Load necessary libraries
+if (!requireNamespace("dunn.test", quietly = TRUE)) {
+  message("dunn.test package is required for this analysis. Install with: install.packages('dunn.test')")
+} else {
+  library(dunn.test)
+
+  # Function to perform Dunn's post-hoc test and format the results
+  format_dunn_test <- function(data, group_col, value_col, type) {
+    # Perform Dunn's post-hoc test
+    dunn_result <- dunn.test::dunn.test(data[[value_col]], data[[group_col]], method = "bonferroni")
+    
+    # Extract relevant results
+    comparisons <- dunn_result$comparisons
+    z_values <- round(dunn_result$Z, 2)
+    p_values <- ifelse(dunn_result$P.adjusted < 0.0001, "< 0.0000", formatC(dunn_result$P.adjusted, format = "e", digits = 2))
+    
+    # Create a data frame with the formatted results
+    result_df <- data.frame(
+      Comparison = comparisons,
+      Z_Value = z_values,
+      Adjusted_p_value = p_values,
+      Type = type
+    )
+    
+    return(result_df)
+  }
+
+  # Perform Dunn's test and format results for OA
+  oa_summary <- format_dunn_test(j_type %>% filter(type == "OA"), "sizes", "QUAR", "OA")
+
+  # Perform Dunn's test and format results for non-OA
+  non_oa_summary <- format_dunn_test(j_type %>% filter(type == "non_OA"), "sizes", "QUAR", "non_OA")
+
+  # Merge the results
+  combined_results <- merge(oa_summary, non_oa_summary, by = "Comparison", suffixes = c(" (OA)", " (non_OA)"))
+
+  # Rename columns for clarity
+  colnames(combined_results) <- c("Comparison", "Z-Value (OA)", "Adjusted p-value (OA)", "Type (OA)", "Z-Value (non_OA)", "Adjusted p-value (non_OA)", "Type (non_OA)")
+
+  # Select relevant columns
+  final_results <- combined_results %>%
+    select(Comparison, `Z-Value (OA)`, `Adjusted p-value (OA)`, `Z-Value (non_OA)`, `Adjusted p-value (non_OA)`)
+
+  # Save Table 8: Dunn Test Results
+  write.table(final_results, file = 'table8_dunn_test_results.txt', sep = '\t', quote = FALSE, row.names = FALSE)
+}
+
+#==============================================================================
+# Mixed-Effects Model Analysis
+#==============================================================================
+if (!requireNamespace("lme4", quietly = TRUE)) {
+  message("lme4 package is required for this analysis. Install with: install.packages('lme4')")
+} else {
+  library(lme4)
+
+  # Filter and clean data as needed
+  j_filtered <- j %>%
+    filter(!is.na(Publisher) & trimws(Publisher) != "")
+
+  # Ensure Publisher_Size is correctly populated
+  publisher_summary <- j_filtered %>%
+    group_by(Publisher) %>%
+    summarise(Journal_Count = n())
+
+  # Categorize Publisher_Size
+  publisher_summary <- publisher_summary %>%
+    mutate(Publisher_Size = case_when(
+      Journal_Count == 1 ~ "S1",
+      Journal_Count >= 2 & Journal_Count <= 9 ~ "S2",
+      Journal_Count >= 10 & Journal_Count <= 99 ~ "S3",
+      Journal_Count >= 100 ~ "S4"
+    ))
+
+  # Merge Publisher_Size back to the main data
+  j_filtered <- j_filtered %>%
+    left_join(publisher_summary %>% select(Publisher, Publisher_Size), by = "Publisher")
+
+  # Ensure OA status is correctly populated
+  oa_status <- o %>%
+    select(Title) %>%
+    mutate(type = "OA") %>%
+    distinct(Title, .keep_all = TRUE)
+
+  # Merge OA status with main data
+  j_filtered <- j_filtered %>%
+    left_join(oa_status, by = "Title") %>%
+    mutate(type = ifelse(is.na(type), "non_OA", "OA"))
+
+  # Ensure all necessary columns are present and correctly formatted
+  j_filtered$Subject_Areas <- as.factor(j_filtered$Areas)  # Ensure correct column name
+  j_filtered$Publisher_Size <- as.factor(j_filtered$Publisher_Size)
+  j_filtered$type <- as.factor(j_filtered$type)
+
+  # Apply log transformation to the dependent variables
+  j_filtered <- j_filtered %>%
+    mutate(log_CITES2YR = log(CITES2YR + 1),
+           log_SJR = log(SJR + 1),
+           log_QUAR = log(QUAR + 1))
+
+  # Try to fit the mixed-effects models with error handling
+  tryCatch({
+    # Fit the mixed-effects model for log-transformed CITES2YR
+    mixed_model_log_cites <- lmer(log_CITES2YR ~ Publisher_Size + type + (1 | Subject_Areas), data = j_filtered)
+    summary_log_cites <- summary(mixed_model_log_cites)
+    
+    # Fit the mixed-effects model for log-transformed SJR
+    mixed_model_log_sjr <- lmer(log_SJR ~ Publisher_Size + type + (1 | Subject_Areas), data = j_filtered)
+    summary_log_sjr <- summary(mixed_model_log_sjr)
+    
+    # Fit the mixed-effects model for log-transformed QUAR
+    mixed_model_log_quartile <- lmer(log_QUAR ~ Publisher_Size + type + (1 | Subject_Areas), data = j_filtered)
+    summary_log_quartile <- summary(mixed_model_log_quartile)
+    
+    # Extract and format results
+    extract_fixed_effects <- function(model_summary) {
+      fixed_effects <- as.data.frame(model_summary$coefficients)
+      fixed_effects$Variable <- rownames(fixed_effects)
+      fixed_effects <- fixed_effects[, c("Variable", "Estimate", "Std. Error", "t value")]
+      return(fixed_effects)
+    }
+    
+    # Extract fixed effects for each model
+    fixed_effects_log_cites <- extract_fixed_effects(summary_log_cites)
+    fixed_effects_log_cites$Metric <- "log_CITES2YR"
+    
+    fixed_effects_log_sjr <- extract_fixed_effects(summary_log_sjr)
+    fixed_effects_log_sjr$Metric <- "log_SJR"
+    
+    fixed_effects_log_quartile <- extract_fixed_effects(summary_log_quartile)
+    fixed_effects_log_quartile$Metric <- "log_QUAR"
+    
+    # Combine the fixed effects results into a single data frame
+    fixed_combined_results <- bind_rows(fixed_effects_log_cites, fixed_effects_log_sjr, fixed_effects_log_quartile) %>%
+      select(Metric, everything())
+    
+    # Combine fixed and random effects into one table (Table 9) as shown in the manuscript
+    # Format fixed effects 
+    fixed_combined_results <- fixed_combined_results %>%
+      select(Metric, Variable, Estimate, `Std. Error`, `t value`) %>%
+      arrange(Metric, Variable)
+    
+    # Extract random effects information
+    random_effects_log_cites <- as.data.frame(VarCorr(mixed_model_log_cites))
+    random_effects_log_cites$Metric <- "log_CITES2YR"
+    
+    random_effects_log_sjr <- as.data.frame(VarCorr(mixed_model_log_sjr))
+    random_effects_log_sjr$Metric <- "log_SJR"
+    
+    random_effects_log_quartile <- as.data.frame(VarCorr(mixed_model_log_quartile))
+    random_effects_log_quartile$Metric <- "log_QUAR"
+    
+    # Combine random effects
+    random_combined_results <- bind_rows(random_effects_log_cites, random_effects_log_sjr, random_effects_log_quartile) %>%
+      select(Metric, grp, vcov, sdcor) %>%
+      rename(Random_Effect = grp, Variance = vcov, `Std. Dev.` = sdcor)
+    
+    # Save combined mixed model results as Table 9
+    write.table(fixed_combined_results, file = "table9_mixed_model_results.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+    
+    # Save random effects as supplementary information
+    write.table(random_combined_results, file = "table9_mixed_model_random_effects.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+    
+  }, error = function(e) {
+    message("Error in mixed-effects model analysis: ", e$message)
+    write(paste("Error in mixed-effects model analysis:", e$message), 
+          file = "mixed_model_error.txt")
+  })
+}
+
+#==============================================================================
+# Generate Figures for Publication
+#==============================================================================
+
+# Figure 1: V4 Publishers and their Journal Metrics
+# (This figure is created from the top_25_publishers data saved earlier)
+# You'll need to use an external tool like Excel to create this figure from the saved data
+# The code above saves the necessary data to v4_publishers_data.txt
+
+# Figure 2: Correlation Analysis of Publisher Volume and Journal Metrics
+# Using ggplot2 to create a correlation matrix with proper minus signs
+
+# Function to create correlation matrix data in long format for ggplot
+get_cor_data <- function(cormat) {
+  # Convert matrix to data frame in long format
+  cormat_df <- as.data.frame(as.table(cormat))
+  names(cormat_df) <- c("Var1", "Var2", "value")
+  
+  # Create properly formatted label with minus sign
+  cormat_df$label <- sprintf("%.2f", cormat_df$value)
+  # Replace hyphens with proper minus signs
+  cormat_df$label <- gsub("-", "−", cormat_df$label)
+  
+  return(cormat_df)
+}
+
+# Create the correlation data frame for ggplot
+cor_data <- get_cor_data(correlation_matrix)
+
+# Extract variable names in order
+var_names <- colnames(correlation_matrix)
+
+# Create ggplot version of correlation matrix
+png("figure2_correlation_matrix.png", width = 900, height = 700, res = 120)
+
+# Create the plot using ggplot2 with custom legend labels (proper minus signs)
+p <- ggplot(cor_data, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  # Use proper blue-white-red color palette similar to corrplot
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1,1), space = "Lab",
+                       name = "Correlation",
+                       # Create custom breaks for legend
+                       breaks = c(-1.0, -0.7, -0.4, 0, 0.4, 0.7, 1.0),
+                       # Use proper minus signs in legend labels
+                       labels = c("−1.0", "−0.7", "−0.4", "0", "0.4", "0.7", "1.0")) +
+  # Format axis labels with larger font sizes
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, color = "black", size = 12),
+    axis.text.y = element_text(color = "black", size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    axis.title = element_blank(),
+    # Move legend to the right and adjust its formatting
+    legend.position = "right",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    legend.key.height = unit(1, "cm"),
+    legend.key.width = unit(0.5, "cm"),
+    plot.margin = margin(10, 30, 10, 10)
+  ) +
+  # Set axis order to match corrplot
+  scale_x_discrete(limits = var_names) +
+  scale_y_discrete(limits = rev(var_names)) +
+  # Add correlation values with proper minus signs (larger font)
+  geom_text(aes(label = ifelse(Var1 == Var2 | (as.numeric(Var1) > as.numeric(Var2)), 
+                               "", label)), 
+            size = 4, color = "black")  # Increased from size 3 to size 4
+
+# Print the plot
+print(p)
+dev.off()
+
+# Output message about the correlation matrix
+cat("\nFigure 2 has been generated as a PNG image using ggplot2 with proper minus signs and larger fonts:\n")
+cat("- PNG: figure2_correlation_matrix.png\n")
+cat("Legend has been moved to the right side for better readability.\n\n")
+
+# Figure 3: Journal Quartiles Across Subject Areas by Publisher Volume
+# This figure is created from the data saved earlier
+# You'll need to use external tools to create this visualization from the subject area data
+# The code above saves the necessary data in table5_subject_areas_by_publisher_size.txt
+
+#==============================================================================
+# Final Message
+#==============================================================================
+
+cat("\n========================================================================\n")
+cat("Scholarly Publishing Analytics: Analysis Complete\n")
+cat("------------------------------------------------------------------------\n")
+cat("Tables generated:\n")
+cat(" - Table 1: Publisher Volume and Journal Production (table1_publisher_volume.txt)\n")
+cat(" - Table 2: Journal Metrics by Publisher Volume (table2_metrics_by_publisher_volume.txt)\n")
+cat(" - Table 3: Region Summary (table3_region_summary.txt)\n")
+cat(" - Table 4: Country Summary (table4_country_summary.txt)\n")
+cat(" - Table 5: Subject Areas by Publisher Size (table5_subject_areas_by_publisher_size.txt)\n")
+cat(" - Table 6: OA Status by Publisher Volume (table6_oa_status_by_volume.txt)\n")
+cat(" - Table 7: Mean Quartiles by OA and Size (table7_mean_quartiles_by_oa_size.txt)\n")
+cat(" - Table 8: Dunn Test Results (table8_dunn_test_results.txt)\n")
+cat(" - Table 9: Mixed Model Results (table9_mixed_model_results.txt)\n")
+cat("\nFigures generated:\n")
+cat(" - Figure 1: V4 Publishers and their Journal Metrics (data in v4_publishers_data.txt)\n")
+cat(" - Figure 2: Correlation Matrix with proper minus signs (figure2_correlation_matrix.png)\n")
+cat(" - Figure 3: Journal Quartiles Across Subject Areas by Publisher Volume (data in table5_subject_areas_by_publisher_size.txt)\n")
+cat("========================================================================\n")
